@@ -3,6 +3,7 @@ package gofakes3_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/johannesboyne/gofakes3"
 	"github.com/johannesboyne/gofakes3/backend/s3mem"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestCreateBucket(t *testing.T) {
@@ -130,6 +132,102 @@ func TestListBucketObjectSize(t *testing.T) {
 
 	if *output.Contents[0].Size != int64(5) {
 		ts.Fatalf("Size wanted 5 got :%v\n", *output.Contents[0].Size)
+	}
+}
+
+func TestListBucketWhileDeleting(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.Close()
+	svc := ts.s3Client()
+
+	const numFiles = 2000
+	prefix := "my/file/prefix"
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("%s/%d", prefix, i)
+		_, err := svc.PutObject(&s3.PutObjectInput{
+			Bucket: aws.String(defaultBucket),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader([]byte("hello")), // size 5
+		})
+		ts.OK(err)
+	}
+
+	ctx := context.Background()
+	eg, ctx := errgroup.WithContext(ctx)
+	objectChan := make(chan []*s3.Object)
+
+	maxListObjPageSize := int64(100)
+
+	eg.Go(func() error {
+		defer close(objectChan)
+
+		result, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{
+			Bucket:  aws.String(defaultBucket),
+			Prefix:  &prefix,
+			MaxKeys: aws.Int64(maxListObjPageSize),
+		})
+		ts.OK(err)
+
+		select {
+		case objectChan <- result.Contents:
+			for *result.IsTruncated {
+				result, err = svc.ListObjectsV2(&s3.ListObjectsV2Input{
+					Bucket:            aws.String(defaultBucket),
+					Prefix:            &prefix,
+					MaxKeys:           aws.Int64(maxListObjPageSize),
+					ContinuationToken: result.NextContinuationToken,
+				})
+				ts.OK(err)
+
+				select {
+				case objectChan <- result.Contents:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	numObjects := 0
+
+	eg.Go(func() error {
+		for objects := range objectChan {
+			if len(objects) == 0 {
+				continue
+			}
+
+			objectIds := make([]*s3.ObjectIdentifier, len(objects))
+			for i, object := range objects {
+				objectIds[i] = &s3.ObjectIdentifier{Key: object.Key}
+			}
+
+			output, err := svc.DeleteObjects(&s3.DeleteObjectsInput{
+				Bucket: aws.String(defaultBucket),
+				Delete: &s3.Delete{Objects: objectIds},
+			})
+			ts.OK(err)
+			numObjects += len(output.Deleted)
+		}
+		return nil
+	})
+	err := eg.Wait()
+	ts.OK(err)
+
+	listInput := s3.ListObjectsV2Input{
+		Bucket:  aws.String(defaultBucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int64(maxListObjPageSize),
+	}
+
+	output, err := svc.ListObjectsV2(&listInput)
+	ts.OK(err)
+
+	if len(output.Contents) != 0 {
+		ts.Fatalf("All objects should be deleted, got %d left", len(output.Contents))
 	}
 }
 

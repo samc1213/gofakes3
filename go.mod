@@ -9,6 +9,7 @@ require (
 	github.com/spf13/afero v1.2.1
 	github.com/stretchr/testify v1.5.1
 	go.etcd.io/bbolt v1.3.5
+	golang.org/x/sync v0.6.0
 	golang.org/x/tools v0.8.0
 	gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce
 )
